@@ -11,12 +11,19 @@ on:
     branches: [ development ]
   pull_request:
     branches: [ development ]
+  # Allow manual execution of tests on a specific branch
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to run tests on'
+        required: true
+        default: 'development'
 
 jobs:
   # Execute tests on windows server. Test scenario:
   # - Import reg files with "issues"
   # - Execute script with few parameter combinations
-  # - Check results 
+  # - Check results
   Test-Before-Release:
     # The type of runner that the job will run on
     runs-on: windows-latest
