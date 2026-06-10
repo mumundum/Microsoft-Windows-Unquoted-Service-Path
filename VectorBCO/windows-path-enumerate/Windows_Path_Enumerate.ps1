@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Fix for Microsoft Windows Unquoted Service Path Enumeration
 
@@ -74,6 +74,14 @@
 
 .PARAMETER LogName
     Parameter allow to change output file location, or disable logging setting this parameter to empty string or $null.
+
+.PARAMETER RestartAffectedServices
+    Restart services whose ImagePath values were changed.
+    By default, script asks for confirmation before restarting services.
+
+.PARAMETER RestartWithoutPrompt
+    Works together with RestartAffectedServices and suppresses confirmation prompt.
+    Useful for non-interactive execution.
 
 .EXAMPLE
     # Run powershell as administrator and type path to this script. In case if it will not run type dot (.) before path.
@@ -217,19 +225,27 @@ Param (
         ParameterSetName = "Fixing")]
         [Switch]$Silent,
 
+    [parameter(Mandatory = $False,
+        ParameterSetName = "Fixing")]
+        [Switch]$RestartAffectedServices,
+
+    [parameter(Mandatory = $False,
+        ParameterSetName = "Fixing")]
+        [Switch]$RestartWithoutPrompt,
+
     [parameter(Mandatory = $true,
         ParameterSetName = "Help")]
     [Alias("h")]
         [switch]$Help
 )
 
-Function Fix-ServicePath {
+Function Set-ServicePath {
     <#
     .SYNOPSIS
         Microsoft Windows Unquoted Service Path Enumeration
 
     .DESCRIPTION
-        Use Fix-ServicePath to fix vulnerability "Unquoted Service Path Enumeration".
+        Use Set-ServicePath to fix vulnerability "Unquoted Service Path Enumeration".
 
     .PARAMETER FixServices
         This switch parameter allow proceed Services with vulnerability. By default this parameter enabled.
@@ -248,8 +264,16 @@ Function Fix-ServicePath {
         With this parameter script would not be changing anything on your system,
         and only will show information about possible changes
 
+    .PARAMETER RestartAffectedServices
+        Restart services whose ImagePath values were changed.
+        By default, function asks for confirmation before restarting services.
+
+    .PARAMETER RestartWithoutPrompt
+        Works together with RestartAffectedServices and suppresses confirmation prompt.
+        Useful for non-interactive execution.
+
     .EXAMPLE
-        Fix-ServicePath
+        Set-ServicePath
 
 
     VERBOSE:
@@ -268,7 +292,7 @@ Function Fix-ServicePath {
 
 
     .EXAMPLE
-        Fix-ServicePath -FixEnv
+        Set-ServicePath -FixEnv
 
 
     VERBOSE:
@@ -286,7 +310,7 @@ Function Fix-ServicePath {
         Env variable %ProgramFiles% replaced to full path 'C:\Program Files' in service 'BadDriver'
 
     .EXAMPLE
-        Fix-ServicePath -FixUninstall -FixServices:$False -WhatIf
+        Set-ServicePath -FixUninstall -FixServices:$False -WhatIf
 
 
     VERBOSE:
@@ -301,7 +325,7 @@ Function Fix-ServicePath {
 
 
     .NOTES
-        Name:  Fix-ServicePath
+        Name:  Set-ServicePath
         Version: 3.5
         Author: Vector BCO
         Last Modified: 3 May 2020
@@ -319,7 +343,9 @@ Function Fix-ServicePath {
         [Switch]$Backup,
         [string]$BackupFolder = "C:\Temp\PathEnumeration",
         [Switch]$WhatIf,
-        [Switch]$Passthru
+        [Switch]$Passthru,
+        [Switch]$RestartAffectedServices,
+        [Switch]$RestartWithoutPrompt
     )
 
     # Get all services
@@ -340,12 +366,14 @@ Function Fix-ServicePath {
         }
     }
     $PTElements = @()
+    $AffectedServices = New-Object System.Collections.Generic.HashSet[string]
     ForEach ($FixParameter in $FixParameters) {
         Get-ChildItem $FixParameter.Path -ErrorAction SilentlyContinue | ForEach-Object {
             $SpCharREGEX = '([\[\]])'
             $RegistryPath = $_.name -Replace 'HKEY_LOCAL_MACHINE', 'HKLM:' -replace $SpCharREGEX, '`$1'
             $OriginalPath = (Get-ItemProperty "$RegistryPath")
             $ImagePath = $OriginalPath.$($FixParameter.ParamName)
+            $CannotParseImagePath = $false
             If ($FixEnv) {
                 If ($($OriginalPath.$($FixParameter.ParamName)) -match '%(?''envVar''[^%]+)%') {
                     $EnvVar = $Matches['envVar']
@@ -358,22 +386,25 @@ Function Fix-ServicePath {
             If (($ImagePath -like "* *") -and ($ImagePath -notLike '"*"*') -and ($ImagePath -like '*.exe*')) {
                 # Skip MsiExec.exe in uninstall strings
                 If ((($FixParameter.ParamName -eq 'UninstallString') -and ($ImagePath -NotMatch 'MsiExec(\.exe)?') -and ($ImagePath -Match '^((\w\:)|(%[-\w_()]+%))\\')) -or ($FixParameter.ParamName -eq 'ImagePath')) {
-                    $NewPath = ($ImagePath -split ".exe ")[0]
-                    $key = ($ImagePath -split ".exe ")[1]
-                    $trigger = ($ImagePath -split ".exe ")[2]
                     $NewValue = ''
-                    # Get service with vulnerability with key in ImagePath
-                    If (-not ($trigger | Measure-Object).count -ge 1) {
-                        If (($NewPath -like "* *") -and ($NewPath -notLike "*.exe")) {
-                            $NewValue = "`"$NewPath.exe`" $key"
+                    # Parse executable path and optional arguments in a resilient way.
+                    If ($ImagePath -match '^(?<ExePath>(?:%[-\w_()]+%|[A-Za-z]:)\\.*?\.(?:exe|com|bat|cmd))(?<Args>\s+.*)?$') {
+                        $NewPath = $Matches['ExePath']
+                        $key = $Matches['Args']
+
+                        If (($NewPath -like "* *") -and (-not [string]::IsNullOrWhiteSpace($key))) {
+                            $NewValue = "`"$NewPath`"$key"
                         } # End If
-                        # Get service with vulnerability with out key in ImagePath
-                        ElseIf (($NewPath -like "* *") -and ($NewPath -like "*.exe")) {
+                        ElseIf ($NewPath -like "* *") {
                             $NewValue = "`"$NewPath`""
                         } # End ElseIf
+
                         If ((-not ([string]::IsNullOrEmpty($NewValue))) -and ($NewPath -like "* *")) {
                             try {
                                 $soft_service = $(if ($FixParameter.ParamName -Eq 'ImagePath') {'Service'}Else {'Software'})
+                                If ($soft_service -eq 'Service') {
+                                    [void]$AffectedServices.Add($OriginalPath.PSChildName)
+                                }
                                 $OriginalPSPathOptimized = $OriginalPath.PSPath -replace $SpCharREGEX, '`$1'
                                 Write-Output "$(get-date -format u)  :  Old Value : $soft_service : '$($OriginalPath.PSChildName)' - $($OriginalPath.$($FixParameter.ParamName))"
                                 Write-Output "$(get-date -format u)  :  Expected  : $soft_service : '$($OriginalPath.PSChildName)' - $NewValue"
@@ -418,14 +449,68 @@ Function Fix-ServicePath {
                             } # End Catch
                             Clear-Variable NewValue
                         } # End If
+                    } else {
+                        $CannotParseImagePath = $true
                     } # End Main If
                 } # End if (Skip not needed strings)
             } # End If
-            If (($trigger | Measure-Object).count -ge 1) {
+            If ($CannotParseImagePath) {
                 Write-Output "$(get-date -format u)  :  ERROR  : Can't parse  $($OriginalPath.$($FixParameter.ParamName)) in registry  $($OriginalPath.PSPath -replace 'Microsoft\.PowerShell\.Core\\Registry\:\:') "
             } # End If
         } # End Foreach
     } # End Foreach
+    If ($AffectedServices.Count -ge 1) {
+        $ServiceList = @($AffectedServices) -join ', '
+        If ($WhatIf) {
+            Write-Output "$(get-date -format u)  :  WARNING  : Changed service paths require service restart (or reboot) to take effect. Affected services (preview): $ServiceList"
+        } else {
+            Write-Output "$(get-date -format u)  :  WARNING  : Changed service paths require service restart (or reboot) to take effect. Affected services: $ServiceList"
+        }
+
+        if ($RestartAffectedServices -and $FixServices) {
+            if ($WhatIf) {
+                Write-Output "$(get-date -format u)  :  INFO  : WhatIf selected. Services would be restarted: $ServiceList"
+            } else {
+                $ProceedRestart = $true
+                if (-not $RestartWithoutPrompt) {
+                    try {
+                        $Title = "Restart affected services"
+                        $Message = "Service path updates were applied. Restart affected services now?"
+                        $Choices = @(
+                            (New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', 'Restart affected services now'),
+                            (New-Object System.Management.Automation.Host.ChoiceDescription '&No', 'Skip automatic restart')
+                        )
+                        $Selected = $Host.UI.PromptForChoice($Title, $Message, $Choices, 1)
+                        $ProceedRestart = ($Selected -eq 0)
+                    } catch {
+                        $ProceedRestart = $false
+                        Write-Output "$(get-date -format u)  :  WARNING  : Interactive prompt unavailable. Re-run with -RestartWithoutPrompt to restart services automatically."
+                    }
+                }
+
+                if ($ProceedRestart) {
+                    foreach ($AffectedService in $AffectedServices) {
+                        try {
+                            $Svc = Get-Service -Name $AffectedService -ErrorAction Stop
+                            if ($Svc.Status -eq 'Running') {
+                                Restart-Service -Name $AffectedService -ErrorAction Stop
+                                Write-Output "$(get-date -format u)  :  SUCCESS  : Service '$AffectedService' was restarted."
+                            } elseif ($Svc.Status -eq 'Stopped') {
+                                Write-Output "$(get-date -format u)  :  INFO  : Service '$AffectedService' is stopped. New path will be used on next start."
+                            } else {
+                                Restart-Service -Name $AffectedService -ErrorAction Stop
+                                Write-Output "$(get-date -format u)  :  SUCCESS  : Service '$AffectedService' restart was requested from state '$($Svc.Status)'."
+                            }
+                        } catch {
+                            Write-Output "$(get-date -format u)  :  ERROR  : Failed to restart service '$AffectedService'. $_"
+                        }
+                    }
+                } else {
+                    Write-Output "$(get-date -format u)  :  INFO  : Automatic service restart skipped."
+                }
+            }
+        }
+    }
     if ($Passthru){
         return $PTElements
     }
@@ -442,7 +527,7 @@ Function Get-OSandPoShArchitecture {
     } else { Return $false, $false }
 }
 
-Function Tee-Log {
+Function Write-Log {
     param(
         [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
             $Input,
@@ -457,6 +542,12 @@ Function Tee-Log {
     }
 }
 
+Function Test-IsAdministrator {
+    $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $Principal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
+    return $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 if ((! $FixServices) -and (! $FixUninstall)){
     Throw "Should be selected at least one of two parameters: FixServices or FixUninstall. `r`n For more details use 'get-help Windows_Path_Enumerate.ps1 -full'"
 }
@@ -465,6 +556,10 @@ if ($Help){
     Write-Output "For help use this command in powershell: Get-Help $($MyInvocation.MyCommand.Path) -full"
     powershell -command "& Get-Help $($MyInvocation.MyCommand.Path) -full"
     exit
+}
+
+if (-not (Test-IsAdministrator)) {
+    Throw "Administrator privileges are required to modify service and uninstall registry paths. Re-run PowerShell as Administrator."
 }
 
 $OS, $PoSh = Get-OSandPoShArchitecture
@@ -505,44 +600,38 @@ If (! (Test-Path $LogName)){
 }
 
 
-'*********************************************************************' | Tee-Log -FilePath $LogName -Silent:$Passthru
-"$(get-date -format u)  :  INFO  : ComputerName: $($Env:ComputerName)" | Tee-Log -FilePath $LogName -Silent:$Passthru
-$validation | Tee-Log -FilePath $LogName -Silent:$Passthru
+'*********************************************************************' | Write-Log -FilePath $LogName -Silent:$Passthru
+"$(get-date -format u)  :  INFO  : ComputerName: $($Env:ComputerName)" | Write-Log -FilePath $LogName -Silent:$Passthru
+$validation | Write-Log -FilePath $LogName -Silent:$Passthru
 
 if ($RestoreBackup){
-    if ($FixServices -and (! $FixUninstall)){
-        $RegexPart = "Service"
-    } elseif ($FixUninstall -and (! $FixServices)) {
-        $RegexPart = "Software"
-    } elseif ($FixUninstall -and $FixServices) {
-        $RegexPart = "(Service|Software)"
-    }
-
     if (Test-Path $BackupFolderPath){
-        $FilesToImport = Get-ChildItem "$BackupFolderPath\" | Where-Object {$_.Name -match "$RegexPart`_.+_\d{4}-\d{1,2}-\d{1,2}_\d{3,6}\.reg$"} 
+        $FilesToImport = Get-ChildItem "$BackupFolderPath\" | Where-Object {$_.Name -match '^(Service|Software)_.+_\d{4}-\d{1,2}-\d{1,2}_\d{3,6}\.reg$'} 
         if ([string]::IsNullOrEmpty($FilesToImport)){
-            Write-Output "$(get-date -format u)  :  No backup files find in $BackupFolderPath" | Tee-Log -FilePath $LogName -Silent:$Passthru
+            Write-Output "$(get-date -format u)  :  No backup files find in $BackupFolderPath" | Write-Log -FilePath $LogName -Silent:$Passthru
         } else {
             Foreach ($FileToImport in $FilesToImport) {
-                Write-Output "$(get-date -format u)  :  Importing '$($FileToImport.Name)' file to the registry" | Tee-Log -FilePath $LogName -Silent:$Passthru
+                Write-Output "$(get-date -format u)  :  Importing '$($FileToImport.Name)' file to the registry" | Write-Log -FilePath $LogName -Silent:$Passthru
                 if ($WhatIf){
-                    Write-Output "$(get-date -format u)  :  Whatif switch selected so nothing changed..." | Tee-Log -FilePath $LogName -Silent:$Passthru
+                    Write-Output "$(get-date -format u)  :  Whatif switch selected so nothing changed..." | Write-Log -FilePath $LogName -Silent:$Passthru
                 } else {
                     REGEDIT /s $($FileToImport.FullName)
                 }
-                #Write-Output "$(get-date -format u)  :  Result : $($ImportResult -split '\r\n' | Where-Object {$_ -NotMatch '^$'})" | Tee-Log -FilePath $LogName -Silent:$Passthru 
+                #Write-Output "$(get-date -format u)  :  Result : $($ImportResult -split '\r\n' | Where-Object {$_ -NotMatch '^$'})" | Write-Log -FilePath $LogName -Silent:$Passthru 
             }
         }
     } else {
-        Write-Output "$(get-date -format u)  :  Backup folder does not exists. Nothing to restore..." | Tee-Log -FilePath $LogName -Silent:$Passthru
+        Write-Output "$(get-date -format u)  :  Backup folder does not exists. Nothing to restore..." | Write-Log -FilePath $LogName -Silent:$Passthru
     }
 } else {
-    $ScriptExecutionResult = Fix-ServicePath `
+    $ScriptExecutionResult = Set-ServicePath `
         -FixUninstall:$FixUninstall `
         -FixServices:$FixServices `
         -WhatIf:$WhatIf `
         -FixEnv:$FixEnv `
         -Passthru:$Passthru `
+        -RestartAffectedServices:$RestartAffectedServices `
+        -RestartWithoutPrompt:$RestartWithoutPrompt `
         -Backup:$CreateBackup `
         -BackupFolder $BackupFolderPath 
 
@@ -551,7 +640,7 @@ if ($RestoreBackup){
         $ScriptExecutionResult = $ScriptExecutionResult | Where-Object {$_.GetType().Name -ne 'PSCustomObject' }
     }
 
-    $ScriptExecutionResult | Tee-Log -FilePath $LogName -Silent:$Passthru
+    $ScriptExecutionResult | Write-Log -FilePath $LogName -Silent:$Passthru
     If ($Passthru){
         If ($Silent -and $(( $Objects | Measure-Object ).Count -ge 1)){
             $True
