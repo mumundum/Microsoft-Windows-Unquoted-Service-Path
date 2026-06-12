@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Fix for Microsoft Windows Unquoted Service Path Enumeration
 

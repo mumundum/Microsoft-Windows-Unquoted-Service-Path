@@ -1,4 +1,4 @@
-﻿# Detection
+# Detection
 
 function Test-UnquotedExecutablePath {
     param(
